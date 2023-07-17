@@ -75,18 +75,52 @@ namespace DiscordRPC
 		Image                  ImageLarge, ImageSmall;
 	};
 
-	// @throw AL::Exception
-	typedef AL::EventHandler<void(const User& user)>                                   IPCConnectionOnReadyEventHandler;
-	typedef AL::EventHandler<void(AL::int32 code, const AL::String& string)>           IPCConnectionOnErrorEventHandler;
+	enum class ErrorCodes : AL::uint16
+	{
+		Unknown                         = 1000,
+
+		InvalidPayload                  = 4000,
+		InvalidCommand                  = 4002,
+		InvalidGuild                    = 4003,
+		InvalidEvent                    = 4004,
+		InvalidChannel                  = 4005,
+		InvalidPermissions              = 4006,
+		InvalidClientID                 = 4007,
+		InvalidOrigin                   = 4008,
+		InvalidToken                    = 4009,
+
+		OAuth2Error                     = 5000,
+		SelectChannelTimedOut           = 5001,
+		GetGuildTimedOut                = 5002,
+		SelectVoiceForceRequired        = 5003,
+		CaptureShortcutAlreadyListening = 5004
+	};
+
+	enum class CloseErrorCodes : AL::uint16
+	{
+		Unknown         = 1000,
+
+		InvalidClientID = 4000,
+		InvalidOrigin   = 4001,
+		RateLimited     = 4002,
+		TokenRevoked    = 4003,
+		InvalidVersion  = 4004,
+		InvalidEncoding = 4005
+	};
 
 	// @throw AL::Exception
-	typedef AL::EventHandler<void()>                                                   IPCConnectionOnConnectEventHandler;
-	typedef AL::EventHandler<void(AL::int32 errorCode, const AL::String& errorString)> IPCConnectionOnDisconnectEventHandler;
+	typedef AL::EventHandler<void(const User& user)>                                          IPCConnectionOnReadyEventHandler;
+	typedef AL::EventHandler<void(ErrorCodes errorCode, const AL::String& errorMessage)>      IPCConnectionOnErrorEventHandler;
+
+	// @throw AL::Exception
+	typedef AL::EventHandler<void()>                                                          IPCConnectionOnConnectEventHandler;
+	typedef AL::EventHandler<void(CloseErrorCodes errorCode, const AL::String& errorMessage)> IPCConnectionOnDisconnectEventHandler;
 
 	class IPCConnection
 	{
 		// https://discord.com/developers/docs/topics/rpc
 		// https://discord.com/developers/docs/rich-presence/how-to
+		// https://discord.com/developers/docs/topics/opcodes-and-status-codes
 		// https://github.com/discord/discord-rpc/blob/master/documentation/hard-mode.md
 
 		enum class OPCodes : AL::uint32
@@ -103,8 +137,6 @@ namespace DiscordRPC
 			OPCodes    OPCode;
 			AL::uint32 Length;
 		};
-
-		static constexpr AL::int64 RPC_VERSION = 1;
 
 		class PathGenerator
 		{
@@ -170,13 +202,22 @@ namespace DiscordRPC
 			}
 		};
 
+		template<typename T>
+		struct Error
+		{
+			T          Code;
+			AL::String Message;
+		};
+
+		static constexpr AL::int64 RPC_VERSION = 1;
+
 		bool                                             isOpen  = false;
 		bool                                             isReady = false;
 
 		User                                             user;
 		AL::Network::UnixSocket<AL::Network::TcpSocket>* socket;
-		AL::int32                                        errorCode;
-		AL::String                                       errorString;
+		Error<ErrorCodes>                                lastError;
+		Error<CloseErrorCodes>                           lastCloseError;
 		AL::uint64                                       packetCounter;
 		AL::String                                       applicationId;
 
@@ -227,8 +268,8 @@ namespace DiscordRPC
 				"IPCConnection already open"
 			);
 
-			errorCode = 0;
-			errorString.Clear();
+			lastError.Code = ErrorCodes::Unknown;
+			lastError.Message.Clear();
 
 			packetCounter = 0;
 
@@ -295,8 +336,8 @@ namespace DiscordRPC
 				isOpen  = false;
 
 				OnDisconnect.Execute(
-					errorCode,
-					errorString
+					lastCloseError.Code,
+					lastCloseError.Message
 				);
 			}
 		}
@@ -587,74 +628,89 @@ namespace DiscordRPC
 
 				case OPCodes::Frame:
 				{
-					auto json = nlohmann::json::parse(
-						std::string(reinterpret_cast<const char*>(buffer), header.Length)
-					);
-
-					auto it = json.find("cmd");
-
-					if ((it != json.end()) && it->is_string())
+					try
 					{
-						auto cmd = it->get<std::string>();
+						auto json = nlohmann::json::parse(
+							std::string(reinterpret_cast<const char*>(buffer), header.Length)
+						);
 
-						if (((it = json.find("evt")) != json.end()) && it->is_string())
+						auto it = json.find("cmd");
+
+						if ((it != json.end()) && it->is_string())
 						{
-							auto evt = it->get<std::string>();
+							auto cmd = it->get<std::string>();
 
-							if (!evt.compare("READY") && !cmd.compare("DISPATCH"))
+							if (((it = json.find("evt")) != json.end()) && it->is_string())
 							{
-								if (!isReady && ((it = json.find("data")) != json.end()))
+								auto evt = it->get<std::string>();
+
+								if (!evt.compare("READY") && !cmd.compare("DISPATCH"))
 								{
-									auto user_it = it->find("user");
-
-									if (user_it != it->end())
+									if (!isReady && ((it = json.find("data")) != json.end()))
 									{
-										user =
+										auto user_it = it->find("user");
+
+										if (user_it != it->end())
 										{
-											.IsBot        = (*user_it)["bot"].get<bool>(),
-											.ID           = (*user_it)["id"].get<std::string>().c_str(),
-											.Name         = (*user_it)["global_name"].get<std::string>().c_str(),
-											.Flags        = static_cast<UserFlags>((*user_it)["flags"].get<AL::uint16>()),
-											.Avatar       = (*user_it)["avatar"].get<std::string>().c_str(),
-											.Premium      = static_cast<UserPremiumTypes>((*user_it)["premium_type"].get<AL::uint8>()),
-											.Username     = (*user_it)["username"].get<std::string>().c_str(),
-											.Disciminator = (*user_it)["discriminator"].get<std::string>().c_str()
-										};
+											user =
+											{
+												.IsBot        = (*user_it)["bot"].get<bool>(),
+												.ID           = (*user_it)["id"].get<std::string>().c_str(),
+												.Name         = (*user_it)["global_name"].get<std::string>().c_str(),
+												.Flags        = static_cast<UserFlags>((*user_it)["flags"].get<AL::uint16>()),
+												.Avatar       = (*user_it)["avatar"].get<std::string>().c_str(),
+												.Premium      = static_cast<UserPremiumTypes>((*user_it)["premium_type"].get<AL::uint8>()),
+												.Username     = (*user_it)["username"].get<std::string>().c_str(),
+												.Disciminator = (*user_it)["discriminator"].get<std::string>().c_str()
+											};
 
-										isReady = true;
+											isReady = true;
 
-										OnReady.Execute(user);
+											OnReady.Execute(user);
 
-										break;
+											break;
+										}
+									}
+								}
+								else if (!evt.compare("ERROR"))
+								{
+									if ((it = json.find("data")) != json.end())
+									{
+										lastError.Code    = (*it)["code"].get<ErrorCodes>();
+										lastError.Message = (*it)["message"].get<std::string>().c_str();
+
+										OnError.Execute(lastError.Code, lastError.Message);
 									}
 								}
 							}
-							else if (!evt.compare("ERROR"))
-							{
-								if ((it = json.find("data")) != json.end())
-								{
-									errorCode   = (*it)["code"].get<AL::int32>();
-									errorString = (*it)["message"].get<std::string>().c_str();
-
-									OnError.Execute(
-										errorCode,
-										errorString
-									);
-								}
-							}
 						}
+					}
+					catch (const nlohmann::json::exception& exception)
+					{
+
+						throw AL::Exception(
+							exception.what()
+						);
 					}
 				}
 				break;
 
 				case OPCodes::Close:
 				{
-					auto json = nlohmann::json::parse(
-						std::string(reinterpret_cast<const char*>(buffer), header.Length)
-					);
+					try
+					{
+						auto json = nlohmann::json::parse(
+							std::string(reinterpret_cast<const char*>(buffer), header.Length)
+						);
 
-					errorCode   = json["code"].get<AL::int32>();
-					errorString = json["message"].get<std::string>().c_str();
+						lastCloseError.Code    = json["code"].get<CloseErrorCodes>();
+						lastCloseError.Message = json["message"].get<std::string>().c_str();
+					}
+					catch (const nlohmann::json::exception& exception)
+					{
+						lastCloseError.Code = CloseErrorCodes::Unknown;
+						lastCloseError.Message.Clear();
+					}
 				}
 				return false;
 
