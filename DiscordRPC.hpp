@@ -271,6 +271,9 @@ namespace DiscordRPC
 			lastError.Code = ErrorCodes::Unknown;
 			lastError.Message.Clear();
 
+			lastCloseError.Code = CloseErrorCodes::Unknown;
+			lastCloseError.Message.Clear();
+
 			packetCounter = 0;
 
 			try
